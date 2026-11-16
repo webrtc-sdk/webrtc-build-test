@@ -82,7 +82,7 @@ jobs:
         echo "runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH), workspace: $GITHUB_WORKSPACE"
         python3 --version; git --version
         case "$RUNNER_OS" in
-          macOS) ls -d /Applications/Xcode*.app || true; xcode-select -p; xcodebuild -version | head -1; sysctl -n hw.ncpu; df -h / "$GITHUB_WORKSPACE" ;;
+          macOS) ls -d /Applications/Xcode*.app || true; xcode-select -p; xcodebuild -version; sysctl -n hw.ncpu; df -h / "$GITHUB_WORKSPACE" ;;
           Windows) powershell -NoProfile -Command 'Get-PSDrive -PSProvider FileSystem | Format-Table Name,Used,Free,Root'
                    "/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath || echo "vswhere: no Visual Studio"
                    nproc ;;
