@@ -94,9 +94,14 @@ jobs:
     - name: Report sizes
       if: always()
       run: |
-        cat '${{ matrix.work_dir }}/_source/webrtc/.gclient' || true
-        { echo '```'
+        W='${{ matrix.work_dir }}'
+        cat "$W/_source/webrtc/.gclient" || true
+        {
+          echo '```'
           # src/resources should be ~empty: test resources are not cached.
-          du -sh '${{ matrix.work_dir }}/_source/depot_tools' '${{ matrix.work_dir }}/_source/webrtc/src' '${{ matrix.work_dir }}/_source/webrtc/src/resources' 2>/dev/null
-          df -h '${{ matrix.work_dir }}' | tail -1
-          echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          du -sh "$W/_source/depot_tools" "$W/_source/webrtc/src" "$W/_source/webrtc/src/resources" \
+                 "$W/_source/webrtc/src/third_party" 2>/dev/null
+          du -sh "$W/_source" 2>/dev/null
+          df -h "$W" | tail -1
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
