@@ -187,7 +187,8 @@ jobs:
         # did not carry over).
         extra=''
         if [[ '${{ matrix.target }}' == libwebrtc_* ]]; then extra='--libwebrtc-dir libwebrtc'; fi
-        python3 scripts/build.py build ${{ matrix.target }} $extra \
+        # TEST ONLY (webrtc-build-test): sync instead of build to check the fan-out.
+        python3 scripts/build.py sync ${{ matrix.target }} \
           --sync-for android libwebrtc_linux_x64 \
           --commit '${{ needs.sync-linux.outputs.commit }}' $CONFIG_ARGS
     - name: Upload packages
