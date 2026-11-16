@@ -93,7 +93,7 @@ jobs:
   # One webrtc checkout per job; targets in a job share it. Apple is split in
   # two jobs to stay well under the 6h limit of GitHub-hosted runners.
   build-apple:
-    if: false  # TEST ONLY: linux fan-out check
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') }}
     name: build (${{ matrix.id }})
     strategy:
       fail-fast: false
@@ -199,7 +199,7 @@ jobs:
         compression-level: 0
 
   build-libwebrtc-windows:
-    if: false  # TEST ONLY: linux fan-out check
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') }}
     name: build (libwebrtc_win_${{ matrix.arch }})
     strategy:
       fail-fast: false
