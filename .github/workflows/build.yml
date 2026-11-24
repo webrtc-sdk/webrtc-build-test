@@ -23,6 +23,10 @@ on:
         description: 'webrtc-sdk/libwebrtc ref for the libwebrtc builds'
         default: 'main'
         required: false
+      rustSdksRef:
+        description: 'livekit/rust-sdks ref for the rust (webrtc-sys) builds'
+        default: 'main'
+        required: false
       force_cache_update:
         description: 'Rebuild the Linux source cache from scratch'
         type: boolean
@@ -40,6 +44,7 @@ on:
           - apple
           - android
           - libwebrtc
+          - rust
   workflow_call:
     inputs:
       commitHash:
@@ -49,6 +54,9 @@ on:
         type: string
         default: 'release'
       libwebrtcRef:
+        type: string
+        default: 'main'
+      rustSdksRef:
         type: string
         default: 'main'
       force_cache_update:
@@ -97,6 +105,12 @@ env:
 # comes from the caller's revision. The resolved values are uploaded as the
 # build-info artifact, which release.yml checks before reusing the packages.
 
+# rust_* (livekit/rust-sdks webrtc-sys prebuilts): build.py runs the
+# webrtc-sys build scripts of the resolved rust-sdks commit on the same
+# checkouts as the other targets. Not part of the release yet: the jobs may
+# fail without failing the workflow (continue-on-error), and their artifacts
+# are named rust-packages-* so release.yml (packages-*) ignores them.
+
 # Dry run (input dry_run, or repository variable BUILD_DRY_RUN=true, e.g. in a
 # test repository): skip every build job and upload placeholder packages with
 # the real names and checksums instead.
@@ -109,6 +123,7 @@ jobs:
       repo: ${{ steps.resolve.outputs.repo }}
       webrtc: ${{ steps.resolve.outputs.webrtc }}
       libwebrtc: ${{ steps.resolve.outputs.libwebrtc }}
+      rust_sdks: ${{ steps.resolve.outputs.rust_sdks }}
     steps:
     - uses: actions/checkout@v5
       with:
@@ -120,6 +135,7 @@ jobs:
         WEBRTC_REPO: ${{ vars.WEBRTC_REPO || 'webrtc-sdk/webrtc' }}
         COMMIT: ${{ inputs.commitHash }}
         LIBWEBRTC_REF: ${{ inputs.libwebrtcRef || 'main' }}
+        RUST_SDKS_REF: ${{ inputs.rustSdksRef || 'main' }}
         CONFIGURATION: ${{ inputs.configuration || 'release' }}
         PLATFORMS: ${{ inputs.platforms || 'all' }}
         DRY_RUN: ${{ (inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && 'true' || 'false' }}
@@ -128,22 +144,25 @@ jobs:
         REPO_SHA=$(git rev-parse HEAD)
         WEBRTC=$(gh api "repos/$WEBRTC_REPO/commits/${COMMIT:-$(python3 scripts/release.py get --key WEBRTC_COMMIT)}" --jq .sha)
         LIBWEBRTC=$(gh api "repos/webrtc-sdk/libwebrtc/commits/$LIBWEBRTC_REF" --jq .sha)
+        RUST_SDKS=$(gh api "repos/livekit/rust-sdks/commits/$RUST_SDKS_REF" --jq .sha)
         {
           echo "repo=$REPO_SHA"
           echo "webrtc=$WEBRTC"
           echo "libwebrtc=$LIBWEBRTC"
+          echo "rust_sdks=$RUST_SDKS"
         } >> "$GITHUB_OUTPUT"
         mkdir -p build-info
         jq -n --arg repo "$REPO_SHA" --arg webrtc_repo "$WEBRTC_REPO" --arg webrtc "$WEBRTC" \
-          --arg libwebrtc "$LIBWEBRTC" --arg configuration "$CONFIGURATION" \
+          --arg libwebrtc "$LIBWEBRTC" --arg rust_sdks "$RUST_SDKS" --arg configuration "$CONFIGURATION" \
           --arg platforms "$PLATFORMS" --argjson dry_run "$DRY_RUN" --arg event "$GITHUB_EVENT_NAME" \
-          '{repo: $repo, webrtc_repo: $webrtc_repo, webrtc: $webrtc, libwebrtc: $libwebrtc,
+          '{repo: $repo, webrtc_repo: $webrtc_repo, webrtc: $webrtc, libwebrtc: $libwebrtc, rust_sdks: $rust_sdks,
             configuration: $configuration, platforms: $platforms, dry_run: $dry_run, event: $event}' \
           | tee build-info/build-info.json
         {
           echo "- this repository: \`$REPO_SHA\`"
           echo "- webrtc ($WEBRTC_REPO): \`$WEBRTC\`"
           echo "- libwebrtc wrapper: \`$LIBWEBRTC\`"
+          echo "- rust-sdks (webrtc-sys): \`$RUST_SDKS\`"
           echo "- configuration: $CONFIGURATION, platforms: $PLATFORMS, dry run: $DRY_RUN"
         } >> "$GITHUB_STEP_SUMMARY"
     - uses: actions/upload-artifact@v4
@@ -172,7 +191,7 @@ jobs:
   # Linux jobs share the Namespace cache volume.
 
   sync-apple:
-    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "apple"]'), inputs.platforms || 'all') }}
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "apple", "rust"]'), inputs.platforms || 'all') }}
     name: gclient sync (apple)
     needs: resolve
     runs-on: macos-26
@@ -209,7 +228,7 @@ jobs:
         retention-days: 1
 
   build-apple:
-    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') }}
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "apple"]'), inputs.platforms || 'all') }}
     name: build (${{ matrix.target }} ${{ matrix.slice }})
     needs: [resolve, sync-apple]
     strategy:
@@ -268,10 +287,49 @@ jobs:
         path: _package/*
         compression-level: 0
 
+  build-rust-apple:
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "rust"]'), inputs.platforms || 'all') }}
+    name: build (${{ matrix.target }})
+    needs: [resolve, sync-apple]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [rust_mac_x64, rust_mac_arm64, rust_ios_device_arm64, rust_ios_simulator_arm64]
+    runs-on: macos-26
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ needs.resolve.outputs.repo }}
+    - uses: actions/checkout@v5
+      with:
+        repository: livekit/rust-sdks
+        ref: ${{ needs.resolve.outputs.rust_sdks }}
+        path: rust-sdks
+        sparse-checkout: webrtc-sys/libwebrtc
+    - name: Select Xcode 26.0
+      run: sudo xcode-select --switch /Applications/Xcode_26.0.app/Contents/Developer
+    - uses: actions/download-artifact@v4
+      with:
+        name: source-apple
+        path: ${{ runner.temp }}
+    - name: Unpack checkout
+      run: |
+        zstd -d -q -c "$RUNNER_TEMP/source-apple.tar.zst" | tar -xf -
+        rm "$RUNNER_TEMP/source-apple.tar.zst"
+    - name: Build
+      run: |
+        python3 scripts/build.py build ${{ matrix.target }} --rust-sdks-dir rust-sdks --no-sync $CONFIG_ARGS
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rust-packages-${{ matrix.target }}
+        path: _package/*
+        compression-level: 0
+
   # Linux: sync the shared checkout once on the Namespace cache volume; each
   # compile job mounts it, so its own sync is skipped or a quick catch-up.
   sync-linux:
-    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "android", "libwebrtc"]'), inputs.platforms || 'all') }}
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "android", "libwebrtc", "rust"]'), inputs.platforms || 'all') }}
     name: gclient sync (linux)
     needs: resolve
     runs-on: namespace-profile-webrtc-android
@@ -392,31 +450,91 @@ jobs:
         path: _package/*
         compression-level: 0
 
-  build-libwebrtc-windows:
-    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "libwebrtc"]'), inputs.platforms || 'all') }}
-    name: build (libwebrtc_win_${{ matrix.arch }})
-    needs: resolve
+  build-rust-linux:
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "rust"]'), inputs.platforms || 'all') }}
+    name: build (${{ matrix.target }})
+    needs: [resolve, sync-linux]
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
-    runs-on: windows-2022
+        target: [rust_linux_x64, rust_linux_arm64, rust_android_arm, rust_android_arm64, rust_android_x64]
+    runs-on: namespace-profile-webrtc-android
     steps:
     - uses: actions/checkout@v5
       with:
         ref: ${{ needs.resolve.outputs.repo }}
     - uses: actions/checkout@v5
       with:
+        repository: livekit/rust-sdks
+        ref: ${{ needs.resolve.outputs.rust_sdks }}
+        path: rust-sdks
+        sparse-checkout: webrtc-sys/libwebrtc
+    - name: Install dependencies
+      # The webrtc-sys scripts copy the headers with cpio.
+      run: |
+        sudo ./scripts/apt_install_x86_64.sh
+        sudo apt-get install -y cpio
+    # build_android.sh relocates the java classes with Gradle 9 (JDK 17+).
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Source cache
+      uses: ./.github/actions/source-cache
+      with:
+        backend: namespace
+        id: linux
+    - name: Build
+      run: |
+        python3 scripts/build.py build ${{ matrix.target }} --rust-sdks-dir rust-sdks \
+          --sync-for android libwebrtc_linux_x64 \
+          --commit '${{ needs.resolve.outputs.webrtc }}' $CONFIG_ARGS
+    - uses: actions/upload-artifact@v4
+      with:
+        name: rust-packages-${{ matrix.target }}
+        path: _package/*
+        compression-level: 0
+
+  # One Windows checkout (no source cache) per arch serves both the libwebrtc
+  # wrapper and the rust build: the second build.py run finds the checkout
+  # synced at the same commit and target_os and skips the sync.
+  build-windows:
+    if: ${{ !(inputs.dry_run || vars.BUILD_DRY_RUN == 'true') && contains(fromJSON('["all", "libwebrtc", "rust"]'), inputs.platforms || 'all') }}
+    name: build (windows ${{ matrix.arch }})
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    runs-on: windows-2022
+    env:
+      BUILD_LIBWEBRTC: ${{ contains(fromJSON('["all", "libwebrtc"]'), inputs.platforms || 'all') }}
+      BUILD_RUST: ${{ contains(fromJSON('["all", "rust"]'), inputs.platforms || 'all') }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ needs.resolve.outputs.repo }}
+    - uses: actions/checkout@v5
+      if: env.BUILD_LIBWEBRTC == 'true'
+      with:
         repository: webrtc-sdk/libwebrtc
         ref: ${{ needs.resolve.outputs.libwebrtc }}
         path: libwebrtc
+    - uses: actions/checkout@v5
+      if: env.BUILD_RUST == 'true'
+      with:
+        repository: livekit/rust-sdks
+        ref: ${{ needs.resolve.outputs.rust_sdks }}
+        path: rust-sdks
+        sparse-checkout: webrtc-sys/libwebrtc
     - name: Source cache
       id: cache
       uses: ./.github/actions/source-cache
       with:
         backend: none
         commit: ${{ needs.resolve.outputs.webrtc }}
-    - name: Build
+    - name: Build arguments
       # The D:\ work drive is too small for a webrtc checkout; use C:\.
       shell: pwsh
       env:
@@ -425,15 +543,37 @@ jobs:
         HISTORY: ${{ steps.cache.outputs.history-arg }}
         CONFIGURATION: ${{ inputs.configuration }}
       run: |
-        $extra = @('--commit', $env:COMMIT)
+        $extra = @('--work-dir', 'C:\wb', '--sync-for', 'libwebrtc_win_x64', '--commit', $env:COMMIT)
         if ($env:FRESH) { $extra += $env:FRESH }
         if ($env:HISTORY) { $extra += $env:HISTORY }
         if ($env:CONFIGURATION -eq 'debug') { $extra += '--debug' }
-        python3 scripts/build.py build libwebrtc_win_${{ matrix.arch }} `
-          --libwebrtc-dir libwebrtc --work-dir 'C:\wb' --sync-for libwebrtc_win_x64 @extra
-    - name: Upload packages
+        "BUILD_ARGS=$($extra -join ' ')" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
+    - name: Build libwebrtc
+      if: env.BUILD_LIBWEBRTC == 'true'
+      shell: pwsh
+      run: |
+        python3 scripts/build.py build libwebrtc_win_${{ matrix.arch }} --libwebrtc-dir libwebrtc `
+          @($env:BUILD_ARGS -split ' ')
+    - name: Upload libwebrtc packages
+      if: env.BUILD_LIBWEBRTC == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: packages-libwebrtc-win-${{ matrix.arch }}
         path: C:\wb\_package\*
+        compression-level: 0
+    - name: Build rust
+      id: rust
+      if: ${{ !cancelled() && env.BUILD_RUST == 'true' }}
+      # Not released yet: a failure does not fail the job.
+      continue-on-error: true
+      shell: pwsh
+      run: |
+        python3 scripts/build.py build rust_win_${{ matrix.arch }} --rust-sdks-dir rust-sdks `
+          --package-dir 'C:\wb\_package_rust' @($env:BUILD_ARGS -split ' ')
+    - name: Upload rust packages
+      if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: rust-packages-rust_win_${{ matrix.arch }}
+        path: C:\wb\_package_rust\*
         compression-level: 0

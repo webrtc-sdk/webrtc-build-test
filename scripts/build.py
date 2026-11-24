@@ -11,6 +11,7 @@ Usage:
     python3 scripts/build.py build android android_prefixed android_prefixed_stripped
     python3 scripts/build.py build libwebrtc_linux_x64 --libwebrtc-dir ../libwebrtc
     python3 scripts/build.py build libwebrtc_win_arm64 --work-dir C:\\wb --libwebrtc-dir ..\\libwebrtc
+    python3 scripts/build.py build rust_linux_x64 --rust-sdks-dir ../rust-sdks
     python3 scripts/build.py test
     python3 scripts/build.py sync android libwebrtc_linux_x64   # checkout only
 
@@ -30,6 +31,9 @@ cached _source only ever holds pristine sources. --keep-out keeps them for
 local incremental builds.
 
 Set GIT_CACHE_PATH to share a gclient git cache between runs.
+
+The rust_* targets run the webrtc-sys build scripts of a livekit/rust-sdks
+checkout on this checkout; see build_rust().
 
 Derived from shiguredo/webrtc-build (Apache-2.0, see NOTICE) and the
 libwebrtc build scripts from webrtc-sdk/libwebrtc.
@@ -68,7 +72,7 @@ HOST = platform.system()  # 'Darwin' | 'Linux' | 'Windows'
 # ---------------------------------------------------------------------------
 
 class Target(NamedTuple):
-    kind: str            # 'apple' | 'android' | 'libwebrtc'
+    kind: str            # 'apple' | 'android' | 'libwebrtc' | 'rust'
     host: str            # platform.system() value the target must be built on
     target_os: List[str]  # gclient target_os entries the target needs
     patches: List[str]   # patches from scripts/patches, applied with -p1 in src
@@ -76,7 +80,11 @@ class Target(NamedTuple):
     package: str = ''    # file name written to the package dir
     prefix: str = ''     # apple: framework name prefix
     os: str = ''         # libwebrtc: 'linux' | 'win'
-    cpu: str = ''        # libwebrtc: 'x64' | 'arm64'
+    cpu: str = ''        # libwebrtc, rust: --arch value
+    script: str = ''     # rust: build script in webrtc-sys/libwebrtc
+    script_args: List[str] = []  # rust: extra script arguments
+    triple: str = ''     # rust: <os>-<arch>, the name webrtc-sys downloads
+    release: bool = True  # part of the release package set (`packages`)
 
 
 # Apple targets only need the host default (mac): target_os 'ios' would also
@@ -157,6 +165,30 @@ for _cpu in ('x64', 'arm64'):
     TARGETS[f'libwebrtc_win_{_cpu}'] = Target(
         kind='libwebrtc', host='Windows', target_os=['win'],
         patches=[], os='win', cpu=_cpu)
+
+# livekit/rust-sdks webrtc-sys prebuilts, same set and names as its
+# webrtc-builds workflow. Not in the release package set yet.
+# target_os: the Apple ones build from the same checkout as the apple
+# targets (mac only), the Linux ones share the Linux source cache.
+for _triple, _host, _target_os, _script, _cpu, _args in [
+    ('linux-x64', 'Linux', ['linux'], 'build_linux.sh', 'x64', []),
+    ('linux-arm64', 'Linux', ['linux'], 'build_linux.sh', 'arm64', []),
+    ('android-arm', 'Linux', ['android'], 'build_android.sh', 'arm', []),
+    ('android-arm64', 'Linux', ['android'], 'build_android.sh', 'arm64', []),
+    ('android-x64', 'Linux', ['android'], 'build_android.sh', 'x64', []),
+    ('mac-x64', 'Darwin', ['mac'], 'build_macos.sh', 'x64', []),
+    ('mac-arm64', 'Darwin', ['mac'], 'build_macos.sh', 'arm64', []),
+    ('ios-device-arm64', 'Darwin', ['mac'], 'build_ios.sh', 'arm64', []),
+    ('ios-simulator-arm64', 'Darwin', ['mac'], 'build_ios.sh', 'arm64',
+     ['--environment', 'simulator']),
+    ('win-x64', 'Windows', ['win'], 'build_windows.cmd', 'x64', []),
+    ('win-arm64', 'Windows', ['win'], 'build_windows.cmd', 'arm64', []),
+]:
+    TARGETS['rust_' + _triple.replace('-', '_')] = Target(
+        kind='rust', host=_host, target_os=_target_os, patches=[],
+        cpu=_cpu, script=_script, script_args=_args, triple=_triple, release=False)
+
+RELEASE_TARGETS = [n for n, t in TARGETS.items() if t.release]
 
 # Shared by the android and unit test builds.
 COMMON_GN_ARGS = [
@@ -354,6 +386,9 @@ class Context:
         self.android_archs = getattr(args, 'android_archs', None) or []
         self.libwebrtc_dir = os.path.abspath(
             args.libwebrtc_dir) if getattr(args, 'libwebrtc_dir', None) else None
+        self.rust_sdks_dir = os.path.abspath(
+            args.rust_sdks_dir) if getattr(args, 'rust_sdks_dir', None) else None
+        self.keep_out = getattr(args, 'keep_out', False)
 
         self.version = read_version_file(os.path.join(ROOT_DIR, 'VERSION'))
         self.commit = args.commit or self.version['WEBRTC_COMMIT']
@@ -563,14 +598,20 @@ def sync(ctx: Context, target_os: List[str]) -> bool:
     return True
 
 
+# Dependency checkouts (separate git repositories under src) that patches
+# touch: jni_prefix.patch third_party/jni_zero, the rust-sdks patches
+# third_party (dav1d, abseil-cpp), third_party/libyuv and build. Reset only,
+# never `git clean`: other dependency checkouts live under them.
+PATCHED_DEP_REPOS = ['third_party', os.path.join('third_party', 'libyuv'), 'build']
+
+
 def reset_tree(ctx: Context):
     """Undo patches and generated files from a previous target."""
     run(['git', 'reset', '--hard', '--quiet'], cwd=ctx.src_dir)
-    # jni_prefix.patch touches third_party/jni_zero (separate repo). Do not
-    # `git clean` there: dependency checkouts live under it.
-    third_party = os.path.join(ctx.src_dir, 'third_party')
-    if os.path.isdir(os.path.join(third_party, '.git')):
-        run(['git', 'reset', '--hard', '--quiet'], cwd=third_party)
+    for rel in PATCHED_DEP_REPOS:
+        repo = os.path.join(ctx.src_dir, rel)
+        if os.path.exists(os.path.join(repo, '.git')):
+            run(['git', 'reset', '--hard', '--quiet'], cwd=repo)
     rm_rf(os.path.join(ctx.src_dir, 'libwebrtc'))
     rm_rf(android_version_java_path(ctx))
     ctx.applied = ()
@@ -1004,6 +1045,83 @@ def build_libwebrtc(ctx: Context, name: str, t: Target):
 
 
 # ---------------------------------------------------------------------------
+# rust: livekit/rust-sdks webrtc-sys prebuilts
+# ---------------------------------------------------------------------------
+#
+# The webrtc-sys build scripts (rust-sdks: webrtc-sys/libwebrtc) own the GN
+# args, the patches (tied to the webrtc-sys C++ code) and the checks on the
+# result, so they are run as they are. They work in the current directory:
+# they skip `gclient sync` when ./src exists, use ./depot_tools, build in
+# ./src/out-<arch>-<config> and write ./<triple>-<config>. Running them in the
+# gclient directory makes them build this checkout at the synced commit.
+
+def link_into(link: str, target: str):
+    """link_dir() that refuses to replace a real directory or file."""
+    if os.path.realpath(link) == os.path.realpath(target):
+        return  # already a link to it (a junction is_link() misses before 3.12)
+    if os.path.lexists(link) and not is_link(link):
+        raise RuntimeError(f'{link} exists and is not a link; move it out of the way')
+    link_dir(link, target)
+
+
+def build_rust(ctx: Context, name: str, t: Target):
+    script_dir = os.path.join(ctx.rust_sdks_dir or '', 'webrtc-sys', 'libwebrtc')
+    script = os.path.join(script_dir, t.script)
+    if not ctx.rust_sdks_dir or not os.path.isfile(script):
+        raise RuntimeError(f'--rust-sdks-dir must point to a livekit/rust-sdks checkout '
+                           f'(missing webrtc-sys/libwebrtc/{t.script})')
+
+    # The scripts apply their patches themselves and skip the ones already
+    # applied, so only a tree patched for something else needs a reset.
+    key = ('rust', script_dir, t.script)
+    if ctx.applied != key and ctx.applied != ():
+        reset_tree(ctx)
+    ctx.applied = key
+
+    # The scripts call `ninja` (`ninja.exe` on Windows) directly; use the one
+    # pinned in DEPS.
+    add_path(os.path.join(ctx.src_dir, 'third_party', 'ninja'))
+    link_into(os.path.join(ctx.gclient_dir, 'depot_tools'), ctx.depot_tools_dir)
+    if HOST != 'Windows':
+        # build_android.sh copies AndroidManifest.xml and the headers from
+        # src next to the script, not from the current directory.
+        link_into(os.path.join(script_dir, 'src'), ctx.src_dir)
+
+    script_out = os.path.join(ctx.src_dir, f'out-{t.cpu}-{ctx.config}')
+    rm_rf(script_out)
+    if ctx.link_out:
+        # Keep the build output off the source cache, like src/out.
+        mkdir_p(ctx.out_dir(name))
+        link_dir(script_out, os.path.realpath(ctx.out_dir(name)))
+    artifacts = os.path.join(ctx.gclient_dir, f'{t.triple}-{ctx.config}')
+    rm_rf(artifacts)
+
+    try:
+        args = ['--arch', t.cpu, '--profile', ctx.config, *t.script_args]
+        if HOST == 'Windows':
+            run(['cmd', '/c', script, *args], cwd=ctx.gclient_dir)
+        else:
+            run(['bash', script, *args], cwd=ctx.gclient_dir)
+        if not os.path.isdir(os.path.join(artifacts, 'lib')):
+            raise RuntimeError(f'{t.script} wrote no {artifacts}/lib')
+
+        # One top-level <triple>-<config> directory, like the rust-sdks
+        # webrtc-builds workflow; webrtc-sys unpacks the zip as is.
+        zip_name = package_name(name, ctx.config)
+        mkdir_p(ctx.out_dir(name))
+        zip_path = os.path.join(ctx.out_dir(name), zip_name)
+        zip_dir(artifacts, zip_path)
+        publish(ctx, zip_path, zip_name)
+    finally:
+        if not ctx.keep_out:
+            rm_rf(script_out)
+            rm_rf(artifacts)
+        for link in (os.path.join(script_dir, 'src'), os.path.join(ctx.gclient_dir, 'depot_tools')):
+            if is_link(link):
+                rm_rf(link)
+
+
+# ---------------------------------------------------------------------------
 # Unit tests (rtc_unittests, debug) on the host platform
 # ---------------------------------------------------------------------------
 
@@ -1080,6 +1198,7 @@ BUILDERS = {
     'apple': build_apple,
     'android': build_android,
     'libwebrtc': build_libwebrtc,
+    'rust': build_rust,
 }
 
 
@@ -1087,6 +1206,8 @@ def package_name(name: str, config: str) -> str:
     t = TARGETS[name]
     if t.kind == 'libwebrtc':
         return f'libwebrtc-{t.os}-{t.cpu}-{config}.zip'
+    if t.kind == 'rust':
+        return f'webrtc-{t.triple}-{config}.zip'
     return t.package
 
 
@@ -1135,6 +1256,14 @@ def clean_outputs(ctx: Context):
         rm_rf(os.path.join(os.path.dirname(ctx.out_root), 'resources'))  # test link
     # The src/out link (older checkouts: a real src/out directory).
     rm_rf(os.path.join(ctx.src_dir, 'out'))
+    # rust_* targets: their scripts' build outputs (src/out-<arch>-<config>,
+    # links on hosts with link_out) and packaging directories.
+    for path in glob.glob(os.path.join(ctx.src_dir, 'out-*')):
+        rm_rf(path)
+    for t in TARGETS.values():
+        if t.kind == 'rust':
+            for config in ('release', 'debug'):
+                rm_rf(os.path.join(ctx.gclient_dir, f'{t.triple}-{config}'))
     if os.path.isdir(os.path.join(ctx.src_dir, 'resources')):
         run(['git', 'clean', '-ffdqX', '--', 'resources'], cwd=ctx.src_dir)
 
@@ -1163,6 +1292,8 @@ def main():
     bp.add_argument('--debug', action='store_true')
     bp.add_argument('--libwebrtc-dir',
                     help='webrtc-sdk/libwebrtc checkout (libwebrtc_* targets)')
+    bp.add_argument('--rust-sdks-dir',
+                    help='livekit/rust-sdks checkout (rust_* targets)')
     bp.add_argument('--apple-slices', type=lambda v: [x for x in v.split(',') if x],
                     help='apple targets: build only these comma-separated slices and archive '
                          'each one for assemble-apple (see apple-slices)')
@@ -1190,6 +1321,8 @@ def main():
     kp = sub.add_parser('packages', help='print the file name of every release package, one '
                                          'per line (the set a release must contain)')
     kp.add_argument('--debug', action='store_true')
+    kp.add_argument('--all', action='store_true',
+                    help='every target, also the ones not released (rust_*)')
 
     tp = sub.add_parser('test', help='build and run rtc_unittests (debug) for the host')
     add_common_args(tp)
@@ -1202,7 +1335,7 @@ def main():
     fp = sub.add_parser('fake', help='write placeholder packages (same names, with checksums) '
                                      'for testing the release workflows without building')
     fp.add_argument('targets', nargs='*', metavar='TARGET',
-                    help='default: all targets (' + ', '.join(TARGETS) + ')')
+                    help='default: the release targets (' + ', '.join(RELEASE_TARGETS) + ')')
     fp.add_argument('--debug', action='store_true')
     fp.add_argument('--package-dir', default=os.path.join(ROOT_DIR, '_package'))
 
@@ -1216,7 +1349,8 @@ def main():
         return
     if args.op == 'packages':
         config = 'debug' if args.debug else 'release'
-        print('\n'.join(package_name(n, config) for n in TARGETS))
+        print('\n'.join(package_name(n, config)
+                         for n in (TARGETS if args.all else RELEASE_TARGETS)))
         return
     if args.op == 'assemble-android':
         ctx = Context(args)
@@ -1235,7 +1369,7 @@ def main():
         unknown = [n for n in args.targets if n not in TARGETS]
         if unknown:
             parser.error(f'unknown targets: {", ".join(unknown)}')
-        write_fake_packages(args.targets or list(TARGETS), args.package_dir,
+        write_fake_packages(args.targets or RELEASE_TARGETS, args.package_dir,
                             'debug' if args.debug else 'release')
         return
 

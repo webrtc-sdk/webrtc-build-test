@@ -14,6 +14,7 @@ Build scripts and CI for [webrtc-sdk/webrtc](https://github.com/webrtc-sdk/webrt
 | `android_prefixed_stripped` | Linux | `libwebrtc_prefixed_stripped.aar` |
 | `libwebrtc_linux_{x64,arm64}` | Linux | `libwebrtc-linux-<arch>-<config>.zip` |
 | `libwebrtc_win_{x64,arm64}` | Windows | `libwebrtc-win-<arch>-<config>.zip` |
+| `rust_<triple>` | Linux, macOS, Windows | `webrtc-<triple>-<config>.zip` (see below) |
 
 Every output is written to `_package/` with a `<name>.shasum` file next to it (`shasum -a 256` format).
 
@@ -26,6 +27,9 @@ python3 scripts/build.py build android android_prefixed android_prefixed_strippe
 
 # libwebrtc wrapper builds need a webrtc-sdk/libwebrtc checkout.
 python3 scripts/build.py build libwebrtc_linux_x64 --libwebrtc-dir ../libwebrtc
+
+# livekit/rust-sdks webrtc-sys prebuilts need a livekit/rust-sdks checkout.
+python3 scripts/build.py build rust_linux_x64 rust_android_arm64 --rust-sdks-dir ../rust-sdks
 
 # Build and run rtc_unittests (debug) for the host platform.
 python3 scripts/build.py test
@@ -41,6 +45,14 @@ Options:
 - `--keep-out`: keep build outputs and the patched tree for incremental local builds. By default every build output under `src/out` is deleted once copied to `_package`, and the tree is reset on exit, so cached checkouts only hold sources.
 - `--fresh`: delete the checkout and sync from scratch.
 - `--sync-for <targets>`: also sync the dependencies of these targets (keeps shared caches identical across jobs).
+
+### rust-sdks prebuilts
+
+The `rust_*` targets produce the prebuilt WebRTC that [livekit/rust-sdks](https://github.com/livekit/rust-sdks) `webrtc-sys` downloads, with the same names and layout as its `webrtc-builds` workflow: triples `linux-{x64,arm64}`, `android-{arm,arm64,x64}`, `mac-{x64,arm64}`, `ios-device-arm64`, `ios-simulator-arm64`, `win-{x64,arm64}`.
+
+build.py only provides the checkout: it runs the build scripts in `webrtc-sys/libwebrtc` of the given rust-sdks checkout, which own the GN arguments, the patches and the checks on the result. The scripts build the synced commit in place of the branch pinned in their `.gclient`. `build_android.sh` needs JDK 17 or newer (Gradle 9).
+
+These targets are not part of the release package set (`scripts/build.py packages`; `--all` lists them too). In CI they run on `platforms: all` and `rust`, may fail without failing the build, and upload `rust-packages-*` artifacts.
 
 Set `GIT_CACHE_PATH` to reuse a gclient git cache across runs.
 
